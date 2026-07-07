@@ -45,9 +45,9 @@
 
 #define DOOR_MONITOR_ACTIVE_BIT    BIT0
 
-#define OVERCURRENT_POLL_MS          20u  /* период опроса тока в обычном режиме    */
-#define OVERCURRENT_CONFIRM_STEP_MS  10u  /* период опроса при подтверждении нуля   */
-#define OVERCURRENT_CONFIRM_TOTAL_MS 40u  /* устойчивый нуль тока -> внутр. концевик */
+#define OVERCURRENT_POLL_MS          20u  
+#define OVERCURRENT_CONFIRM_STEP_MS  10u  
+#define OVERCURRENT_CONFIRM_TOTAL_MS 40u  
 
 static const char *TAG = "door";
 static const char *TAG_OPEN = "door_open";
@@ -379,6 +379,75 @@ static float get_current(void)
 }
 
 /**
+ * Отправляет FAULT event, если ток актуатора остаётся не ниже 0.7 А
+ * в течение 40 мс подряд. Работает постоянно; измеряет ток только пока
+ * установлен DOOR_MONITOR_ACTIVE_BIT.
+ */
+static void overcurrent_monitor_task(void *arg)
+{
+    (void)arg;
+    const float fault_threshold_a = 0.7f;
+    current_sensor_init();
+
+    for (;;) {
+        xEventGroupWaitBits(door_monitor_events, DOOR_MONITOR_ACTIVE_BIT,
+                             pdFALSE, pdFALSE, portMAX_DELAY);
+
+        if (!(xEventGroupGetBits(door_monitor_events) & DOOR_MONITOR_ACTIVE_BIT)) {
+            continue;  // бит сняли раньше, чем задача проснулась
+        }
+
+        float current_a = get_current();
+
+        while (xEventGroupGetBits(door_monitor_events) & DOOR_MONITOR_ACTIVE_BIT) {
+            if (current_a < fault_threshold_a) {
+                vTaskDelay(pdMS_TO_TICKS(OVERCURRENT_POLL_MS));
+                current_a = get_current();
+                continue;
+            }
+
+            // Ток не ниже порога: подтверждение аварии в течение OVERCURRENT_CONFIRM_TOTAL_MS
+            uint32_t time_max_a = 0;
+            bool door_stopped = false;
+
+            while (time_max_a < OVERCURRENT_CONFIRM_TOTAL_MS) {
+                vTaskDelay(pdMS_TO_TICKS(OVERCURRENT_CONFIRM_STEP_MS));
+
+                if (!(xEventGroupGetBits(door_monitor_events) & DOOR_MONITOR_ACTIVE_BIT)) {
+                    door_stopped = true;  // выйти к блокирующему ожиданию, если дверь остановлена
+                    break;
+                }
+
+                current_a = get_current();
+                if (current_a < fault_threshold_a) {
+                    break;  // подтверждение отменено, current_a уже готов для верхнего цикла
+                }
+
+                time_max_a += OVERCURRENT_CONFIRM_STEP_MS;
+            }
+
+            if (door_stopped) {
+                break;  // вернуться к блокирующему ожиданию бита
+            }
+
+            if (time_max_a >= OVERCURRENT_CONFIRM_TOTAL_MS) {
+                door_event_t event = DOOR_EVENT_FAULT;
+                xQueueSend(door_event_queue, &event, 0);
+                ESP_LOGE(TAG, "Авария по току: ток выше %.1f А в течение %"PRIu32" мс",
+                         fault_threshold_a, OVERCURRENT_CONFIRM_TOTAL_MS);
+
+                // Событие отправлено один раз: дальше только ждём снятия бита
+                while (xEventGroupGetBits(door_monitor_events) & DOOR_MONITOR_ACTIVE_BIT) {
+                    vTaskDelay(pdMS_TO_TICKS(OVERCURRENT_CONFIRM_STEP_MS));
+                }
+                break;
+            }
+            // иначе current_a уже ниже порога — обычный контроль продолжается без повторного чтения
+        }
+    }
+}
+
+/**
  * Определяет внутренний концевик по устойчивому исчезновению тока актуатора.
  * Работает постоянно; измеряет ток только пока установлен DOOR_MONITOR_ACTIVE_BIT.
  */
@@ -449,6 +518,87 @@ static void internal_limit_monitor_task(void *arg)
 }
 
 /* ═══════════════════════════════════════════════════════════════════
+   Внешний концевик
+   ═══════════════════════════════════════════════════════════════════ */
+
+/* Реализация датчика внешнего концевика находится во внешнем модуле. */
+static int get_limit(void)
+{
+    return 0;
+}
+
+#define EXTERNAL_LIMIT_POLL_MS          20u  /* период опроса концевика в обычном режиме */
+#define EXTERNAL_LIMIT_CONFIRM_STEP_MS  10u  /* период опроса при подтверждении          */
+#define EXTERNAL_LIMIT_CONFIRM_TOTAL_MS 40u  /* устойчивое срабатывание -> LIMIT event    */
+
+/**
+ * Отправляет LIMIT event, если внешний концевик остаётся сработавшим
+ * не менее 40 мс подряд. Работает постоянно; проверяет концевик только
+ * пока установлен DOOR_MONITOR_ACTIVE_BIT.
+ */
+static void external_limit_monitor_task(void *arg)
+{
+    (void)arg;
+
+    for (;;) {
+        xEventGroupWaitBits(door_monitor_events, DOOR_MONITOR_ACTIVE_BIT,
+                             pdFALSE, pdFALSE, portMAX_DELAY);
+
+        if (!(xEventGroupGetBits(door_monitor_events) & DOOR_MONITOR_ACTIVE_BIT)) {
+            continue;  // бит сняли раньше, чем задача проснулась
+        }
+
+        int limit = get_limit();
+
+        while (xEventGroupGetBits(door_monitor_events) & DOOR_MONITOR_ACTIVE_BIT) {
+            if (limit == 0) {
+                vTaskDelay(pdMS_TO_TICKS(EXTERNAL_LIMIT_POLL_MS));
+                limit = get_limit();
+                continue;
+            }
+
+            // Концевик сработал: подтверждение в течение EXTERNAL_LIMIT_CONFIRM_TOTAL_MS
+            uint32_t limit_time = 0;
+            bool door_stopped = false;
+
+            while (limit_time < EXTERNAL_LIMIT_CONFIRM_TOTAL_MS) {
+                vTaskDelay(pdMS_TO_TICKS(EXTERNAL_LIMIT_CONFIRM_STEP_MS));
+
+                if (!(xEventGroupGetBits(door_monitor_events) & DOOR_MONITOR_ACTIVE_BIT)) {
+                    door_stopped = true;  // выйти к блокирующему ожиданию, если дверь остановлена
+                    break;
+                }
+
+                limit = get_limit();
+                if (limit == 0) {
+                    break;  // подтверждение отменено, limit уже готов для верхнего цикла
+                }
+
+                limit_time += EXTERNAL_LIMIT_CONFIRM_STEP_MS;
+            }
+
+            if (door_stopped) {
+                break;  // вернуться к блокирующему ожиданию бита
+            }
+
+            if (limit_time >= EXTERNAL_LIMIT_CONFIRM_TOTAL_MS) {
+                door_event_t event = DOOR_EVENT_EXTERNAL_LIMIT;
+                xQueueSend(door_event_queue, &event, 0);
+                ESP_LOGW(TAG, "Внешний концевик: сработал %"PRIu32" мс",
+                         EXTERNAL_LIMIT_CONFIRM_TOTAL_MS);
+
+                // Событие отправлено один раз: дальше только ждём снятия бита
+                while (xEventGroupGetBits(door_monitor_events) & DOOR_MONITOR_ACTIVE_BIT) {
+                    vTaskDelay(pdMS_TO_TICKS(EXTERNAL_LIMIT_CONFIRM_STEP_MS));
+                }
+                break;
+            }
+            // иначе limit уже снят — обычная проверка продолжается без повторного чтения
+        }
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════
    Инициализация
    ═══════════════════════════════════════════════════════════════════ */
 
@@ -494,7 +644,7 @@ static void door_monitor_init(void)
     door_event_queue = xQueueCreate(10, sizeof(door_event_t));
     door_monitor_events = xEventGroupCreate();
 
-    //xTaskCreate(overcurrent_monitor_task, "overcurrent_monitor", 2048, NULL, 5, NULL);
+    xTaskCreate(overcurrent_monitor_task, "overcurrent_monitor", 2048, NULL, 5, NULL);
     xTaskCreate(internal_limit_monitor_task, "internal_limit_monitor", 2048, NULL, 4, NULL);
     //xTaskCreate(external_limit_monitor_task, "external_limit_monitor", 2048, NULL, 4, NULL);
 }
@@ -557,8 +707,8 @@ void app_main(void)
 
     door_open();
 
-    for (int i = 0; i < 5; i++){
-        ESP_LOGW(TAG, "%d ...", 5-i);
+    for (int i = 0; i < 3; i++){
+        ESP_LOGW(TAG, "%d ...", 3-i);
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 
