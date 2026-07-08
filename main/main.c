@@ -646,7 +646,7 @@ static void door_monitor_init(void)
 
     xTaskCreate(overcurrent_monitor_task, "overcurrent_monitor", 2048, NULL, 5, NULL);
     xTaskCreate(internal_limit_monitor_task, "internal_limit_monitor", 2048, NULL, 4, NULL);
-    //xTaskCreate(external_limit_monitor_task, "external_limit_monitor", 2048, NULL, 4, NULL);
+    xTaskCreate(external_limit_monitor_task, "external_limit_monitor", 2048, NULL, 4, NULL);
 }
 
 /*static void i2c_scan(void)

@@ -7,10 +7,8 @@
     "--query-driver=**",
     "--compile-commands-dir=c:\\Users\\user\\Projects\\door-control-limit-queue\\door-control-limit-queue\\build"
   ],
-  "idf.currentSetup": "C:\\esp\\v6.0.1\\esp-idf",
-  "idf.openOcdConfigs": [
-    "board/esp32s3-builtin.cfg"
-  ],
+  "idf.currentSetup": "C:\\esp\\v6.0.2\\esp-idf",
+  "idf.openOcdConfigs": ["board/esp32s3-builtin.cfg"],
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32s3"
   },
