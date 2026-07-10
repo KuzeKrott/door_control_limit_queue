@@ -6,7 +6,6 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/i2c.h"
-//#include "driver/i2c_master.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
 #include "esp_err.h"
@@ -45,12 +44,13 @@
 
 #define DOOR_MONITOR_ACTIVE_BIT    BIT0
 
-#define OVERCURRENT_POLL_MS          20u  
-#define OVERCURRENT_CONFIRM_STEP_MS  10u  
-#define OVERCURRENT_CONFIRM_TOTAL_MS 40u  
+#define TASK_POLL_MS          20u  
+#define TASK_CONFIRM_STEP_MS  10u  
+#define TASK_CONFIRM_TOTAL_MS 40u  
 
 static const char *TAG = "door";
 static const char *TAG_OPEN = "door_open";
+static const char *TAG_CLOSE = "door_close";
 
 typedef enum {
     DOOR_STATE_OPENING,
@@ -120,19 +120,6 @@ static esp_err_t dac_set(uint16_t value)
 }
 
 /* ═══════════════════════════════════════════════════════════════════
-   Концевик закрытия
-   ═══════════════════════════════════════════════════════════════════ */
-
-/**
- * NC-датчик + PC817C: металл обнаружен → фототранзистор закрыт → GPIO HIGH.
- * Возвращает true, когда дверь находится в закрытом положении.
- */
-static bool limit_close_active(void)
-{
-    return gpio_get_level(PIN_LIMIT_CLOSE) == 1;
-}
-
-/* ═══════════════════════════════════════════════════════════════════
    Сухие контакты БУКД-5К
    ═══════════════════════════════════════════════════════════════════ */
 
@@ -167,65 +154,56 @@ static void bukd_set_direction(bool opening)
 }
 
 /* ═══════════════════════════════════════════════════════════════════
+   Линейное торможение ЦАП
+   ═══════════════════════════════════════════════════════════════════ */
 
- * Линейно снижает DAC от from до 0 за duration_ms.
- * Проверяет should_stop() перед каждым шагом: если вернула true —
- * немедленно ставит DAC в 0 и возвращает управление.
-
-static esp_err_t dac_ramp_down(uint16_t from, uint32_t duration_ms,
-                                stop_check_fn_t should_stop)
+/**
+ * Линейно снижает ЦАП от from до 0 за duration_ms, проверяя очередь
+ * событий двери перед каждым шагом торможения.
+ * Не выполняет остановку привода — dac_set(0), импульс «сухой контакт»
+ * и очистка бита мониторинга остаются обязанностью door_close(),
+ * которая делает это один раз после возврата из этой функции.
+ * Возвращает true, если торможение завершилось по расчётному времени,
+ * false — если было прервано событием.
+ */
+static bool dac_ramp_down(uint16_t from, uint32_t duration_ms)
 {
     if (duration_ms == 0) {
-        dac_set(0);
-        return false;
+        return true;
     }
 
     int64_t start_us = esp_timer_get_time();
     uint32_t elapsed_ms = 0;
 
     while (elapsed_ms < duration_ms) {
-        if (should_stop()) {
-            ESP_LOGI(TAG, "Торможение прервано по концевику (пройдено %"PRIu32" мс)",
-                     elapsed_ms);
-            dac_set(0);
-            return true;
+        door_event_t event;
+        if (xQueueReceive(door_event_queue, &event, 0) == pdTRUE) {
+            switch (event) {
+                case DOOR_EVENT_FAULT:
+                    ESP_LOGE(TAG_CLOSE, "Торможение: остановка двери — значение тока превышает допустимое");
+                    return false;
+                case DOOR_EVENT_INTERNAL_LIMIT:
+                    ESP_LOGW(TAG_CLOSE, "Торможение: остановка двери — сработал внутренний концевик");
+                    return false;
+                case DOOR_EVENT_EXTERNAL_LIMIT:
+                    ESP_LOGW(TAG_CLOSE, "Торможение: остановка двери — достигнут внешний концевик");
+                    return false;
+                default:
+                    break;  /* событие не требует аварийной остановки — торможение продолжается */
+            }
         }
 
         uint32_t remaining_ms = duration_ms - elapsed_ms;
-        uint16_t dac = (uint16_t)(
-            ((uint32_t)from * remaining_ms + duration_ms / 2) / duration_ms
-        );
-
-        esp_err_t err = dac_set(dac);
-        if (err != ESP_OK) return err;
+        uint16_t dac = (uint16_t)(((uint32_t)from * remaining_ms + duration_ms / 2) / duration_ms);
+        dac_set(dac);
 
         vTaskDelay(pdMS_TO_TICKS(UPDATE_MS));
         elapsed_ms = (uint32_t)((esp_timer_get_time() - start_us) / 1000);
     }
 
-    dac_set(0);
-    return false;
+    ESP_LOGI(TAG_CLOSE, "Торможение: остановка двери — вышло расчётное время");
+    return true;
 }
- */
-/**
- * Ожидание duration_ms с проверкой should_stop() каждые UPDATE_MS.
- * Возвращает true, если ожидание прервано концевиком.
-
-static bool wait_with_stop_check(uint32_t duration_ms, stop_check_fn_t should_stop)
-{
-    uint32_t elapsed_ms = 0;
-
-    while (elapsed_ms < duration_ms) {
-        if (should_stop()) {
-            return true;
-        }
-        vTaskDelay(pdMS_TO_TICKS(UPDATE_MS));
-        elapsed_ms += UPDATE_MS;
-    }
-
-    return false;
-}
-*/
 
 static bool dac_ramp_up(uint16_t from, uint16_t to, uint32_t total_ms)
 {
@@ -239,13 +217,13 @@ static bool dac_ramp_up(uint16_t from, uint16_t to, uint32_t total_ms)
         if (xQueueReceive(door_event_queue, &event, 0) == pdTRUE) {
             switch (event) {
                 case DOOR_EVENT_FAULT:
-                    ESP_LOGE(TAG, "Разгон прерван: во время разгона ток превысил допустимое значение");
+                    ESP_LOGE(TAG_OPEN, "Разгон прерван: во время разгона ток превысил допустимое значение");
                     return false;
                 case DOOR_EVENT_INTERNAL_LIMIT:
-                    ESP_LOGW(TAG, "Разгон прерван: во время разгона обнаружен внутренний концевик");
+                    ESP_LOGW(TAG_OPEN, "Разгон прерван: во время разгона обнаружен внутренний концевик");
                     return false;
                 default:
-                    ESP_LOGE(TAG, "Разгон прерван: неизвестное событие");
+                    ESP_LOGE(TAG_OPEN, "Разгон прерван: неизвестное событие");
                     return false;
             }
         }
@@ -314,56 +292,58 @@ static void door_open(void)
 
 static void door_close(void)
 {
-    ESP_LOGI(TAG, "Закрытие: DAC_MAX на 30 секунд");
-    bukd_set_direction(false);
-
-    esp_err_t err = dac_set(DAC_MAX);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Не удалось установить DAC_MAX: %s",
-                esp_err_to_name(err));
-        return;
-    }
-
-    bukd_pulse_start_stop();
-    vTaskDelay(pdMS_TO_TICKS(25000));
-    door_stop_immediately();
-}
-    /*if (limit_close_active()) {
-        ESP_LOGW(TAG, "Закрытие отменено: концевик уже активен");
-        return;
-    }
-
     if (CLOSE_VIRTUAL_STROKE_MM <= D_DECEL_MM) {
-        ESP_LOGE(TAG, "Ошибка профиля: CLOSE_VIRTUAL_STROKE_MM должна быть > D_DECEL_MM");
+        ESP_LOGE(TAG_CLOSE, "Ошибка профиля: CLOSE_VIRTUAL_STROKE_MM должна быть > D_DECEL_MM");
         return;
     }
 
-    const float coast_mm = CLOSE_VIRTUAL_STROKE_MM - D_DECEL_MM;
-    const uint32_t coast_ms = (uint32_t)(1000.0f * coast_mm  / V_MAX_MM_S + 0.5f);
-    const uint32_t decel_ms = (uint32_t)(2000.0f * D_DECEL_MM / V_MAX_MM_S + 0.5f);
+    door_event_t event;
+    xQueueReset(door_event_queue);
+    xEventGroupSetBits(door_monitor_events, DOOR_MONITOR_ACTIVE_BIT);  // Включить мониторинг событий двери
 
-    ESP_LOGI(TAG,
+    const float coast_distance_mm = CLOSE_VIRTUAL_STROKE_MM - D_DECEL_MM;
+    const uint32_t coast_ms = (uint32_t)(1000.0f * coast_distance_mm / V_MAX_MM_S);
+    const uint32_t decel_ms = (uint32_t)(2.0f * 1000.0f * D_DECEL_MM / V_MAX_MM_S);
+
+    ESP_LOGI(TAG_CLOSE,
              "Закрытие: virtual=%.0f мм, ход=%"PRIu32" мс, торможение=%"PRIu32" мс",
              CLOSE_VIRTUAL_STROKE_MM, coast_ms, decel_ms);
 
     bukd_set_direction(false);
-    ESP_ERROR_CHECK(dac_set(DAC_MAX));
+    dac_set(DAC_MAX);
     bukd_pulse_start_stop();
+    ESP_LOGI(TAG_CLOSE, "Закрытие: максимальная скорость");
 
-    ESP_LOGI(TAG, "Закрытие: максимальная скорость");
-    bool stopped_early = wait_with_stop_check(coast_ms, limit_close_active);    // Проверяет, что концевик сработал во время хода 
+    BaseType_t event_received = xQueueReceive(door_event_queue, &event, pdMS_TO_TICKS(coast_ms)); // Ждать первое событие не дольше coast_ms
 
-    if (!stopped_early) {
-        ESP_LOGI(TAG, "Закрытие: линейное торможение");
-        stopped_early = dac_ramp_down(DAC_MAX, decel_ms, limit_close_active);  // Проверяет, что концевик сработал во время торможения
-        vTaskDelay(pdMS_TO_TICKS(UPDATE_MS));    // дать DAC=0 дойти до MCP4725 
+    if (event_received == pdTRUE) {
+        switch (event) {
+            case DOOR_EVENT_FAULT:
+                ESP_LOGE(TAG_CLOSE, "Остановка двери: значение тока превышает допустимое");
+                door_stop_immediately();
+                return;
+
+            case DOOR_EVENT_INTERNAL_LIMIT:
+                ESP_LOGW(TAG_CLOSE, "Остановка двери: внутренний концевик");
+                door_stop_immediately();
+                return;
+
+            case DOOR_EVENT_EXTERNAL_LIMIT:
+                ESP_LOGW(TAG_CLOSE, "Остановка двери: достигнут внешний концевик");
+                door_stop_immediately();
+                return;
+
+            default:
+                break;  /* прочие события не требуют аварийной остановки — переходим к торможению */
+        }
     }
 
-    ESP_LOGI(TAG, "Закрытие: стоп%s",
-             stopped_early ? " (по концевику)" : "(По расчётной позиции)");
-    bukd_pulse_start_stop();
+    ESP_LOGI(TAG_CLOSE, "Закрытие: линейное торможение");
+
+    dac_ramp_down(DAC_MAX, decel_ms);  /* причина завершения торможения уже залогирована внутри */
+
+    door_stop_immediately();
 }
-*/
 
 /* ═══════════════════════════════════════════════════════════════════
    Датчик тока актуатора
@@ -401,17 +381,17 @@ static void overcurrent_monitor_task(void *arg)
 
         while (xEventGroupGetBits(door_monitor_events) & DOOR_MONITOR_ACTIVE_BIT) {
             if (current_a < fault_threshold_a) {
-                vTaskDelay(pdMS_TO_TICKS(OVERCURRENT_POLL_MS));
+                vTaskDelay(pdMS_TO_TICKS(TASK_POLL_MS));
                 current_a = get_current();
                 continue;
             }
 
-            // Ток не ниже порога: подтверждение аварии в течение OVERCURRENT_CONFIRM_TOTAL_MS
+            // Ток не ниже порога: подтверждение аварии в течение TASK_CONFIRM_TOTAL_MS
             uint32_t time_max_a = 0;
             bool door_stopped = false;
 
-            while (time_max_a < OVERCURRENT_CONFIRM_TOTAL_MS) {
-                vTaskDelay(pdMS_TO_TICKS(OVERCURRENT_CONFIRM_STEP_MS));
+            while (time_max_a < TASK_CONFIRM_TOTAL_MS) {
+                vTaskDelay(pdMS_TO_TICKS(TASK_CONFIRM_STEP_MS));
 
                 if (!(xEventGroupGetBits(door_monitor_events) & DOOR_MONITOR_ACTIVE_BIT)) {
                     door_stopped = true;  // выйти к блокирующему ожиданию, если дверь остановлена
@@ -423,22 +403,22 @@ static void overcurrent_monitor_task(void *arg)
                     break;  // подтверждение отменено, current_a уже готов для верхнего цикла
                 }
 
-                time_max_a += OVERCURRENT_CONFIRM_STEP_MS;
+                time_max_a += TASK_CONFIRM_STEP_MS;
             }
 
             if (door_stopped) {
                 break;  // вернуться к блокирующему ожиданию бита
             }
 
-            if (time_max_a >= OVERCURRENT_CONFIRM_TOTAL_MS) {
+            if (time_max_a >= TASK_CONFIRM_TOTAL_MS) {
                 door_event_t event = DOOR_EVENT_FAULT;
                 xQueueSend(door_event_queue, &event, 0);
                 ESP_LOGE(TAG, "Авария по току: ток выше %.1f А в течение %"PRIu32" мс",
-                         fault_threshold_a, OVERCURRENT_CONFIRM_TOTAL_MS);
+                         fault_threshold_a, TASK_CONFIRM_TOTAL_MS);
 
                 // Событие отправлено один раз: дальше только ждём снятия бита
                 while (xEventGroupGetBits(door_monitor_events) & DOOR_MONITOR_ACTIVE_BIT) {
-                    vTaskDelay(pdMS_TO_TICKS(OVERCURRENT_CONFIRM_STEP_MS));
+                    vTaskDelay(pdMS_TO_TICKS(TASK_CONFIRM_STEP_MS));
                 }
                 break;
             }
@@ -467,7 +447,7 @@ static void internal_limit_monitor_task(void *arg)
         float prev_current = get_current();
 
         while (xEventGroupGetBits(door_monitor_events) & DOOR_MONITOR_ACTIVE_BIT) {
-            vTaskDelay(pdMS_TO_TICKS(OVERCURRENT_POLL_MS));
+            vTaskDelay(pdMS_TO_TICKS(TASK_POLL_MS));
             float current = get_current();
 
             if (!(prev_current != 0.0f && current == 0.0f)) {
@@ -475,12 +455,12 @@ static void internal_limit_monitor_task(void *arg)
                 continue;
             }
 
-            // Ток исчез: подтверждение падения тока в течение OVERCURRENT_CONFIRM_TOTAL_MS 
+            // Ток исчез: подтверждение падения тока в течение TASK_CONFIRM_TOTAL_MS 
             uint32_t time0 = 0;
             bool door_stopped = false;
 
-            while (time0 < OVERCURRENT_CONFIRM_TOTAL_MS) {
-                vTaskDelay(pdMS_TO_TICKS(OVERCURRENT_CONFIRM_STEP_MS));
+            while (time0 < TASK_CONFIRM_TOTAL_MS) {
+                vTaskDelay(pdMS_TO_TICKS(TASK_CONFIRM_STEP_MS));
 
                 if (!(xEventGroupGetBits(door_monitor_events) & DOOR_MONITOR_ACTIVE_BIT)) {
                     door_stopped = true; //Флаг гарантирует выход из цикла подтверждения, если дверь остановлена
@@ -493,22 +473,22 @@ static void internal_limit_monitor_task(void *arg)
                     break;
                 }
 
-                time0 += OVERCURRENT_CONFIRM_STEP_MS;
+                time0 += TASK_CONFIRM_STEP_MS;
             }
 
             if (door_stopped) {
                 break;  // вернуться к блокирующему ожиданию бита 
             }
 
-            if (time0 >= OVERCURRENT_CONFIRM_TOTAL_MS) {
+            if (time0 >= TASK_CONFIRM_TOTAL_MS) {
                 door_event_t event = DOOR_EVENT_INTERNAL_LIMIT;
                 xQueueSend(door_event_queue, &event, 0);
                 ESP_LOGW(TAG, "Внутренний концевик: ток отсутствовал %"PRIu32" мс",
-                         OVERCURRENT_CONFIRM_TOTAL_MS);
+                         TASK_CONFIRM_TOTAL_MS);
 
                 // Событие отправлено один раз: дальше только ждём снятия бита 
                 while (xEventGroupGetBits(door_monitor_events) & DOOR_MONITOR_ACTIVE_BIT) {
-                    vTaskDelay(pdMS_TO_TICKS(OVERCURRENT_CONFIRM_STEP_MS));
+                    vTaskDelay(pdMS_TO_TICKS(TASK_CONFIRM_STEP_MS));
                 }
                 break;
             }
@@ -518,18 +498,16 @@ static void internal_limit_monitor_task(void *arg)
 }
 
 /* ═══════════════════════════════════════════════════════════════════
-   Внешний концевик
+   Внешний Концевик закрытия
    ═══════════════════════════════════════════════════════════════════ */
-
-/* Реализация датчика внешнего концевика находится во внешнем модуле. */
+/**
+ * NC-датчик + PC817C: металл обнаружен → фототранзистор закрыт → GPIO HIGH.
+ * Возвращает true, когда дверь находится в закрытом положении.
+ */
 static int get_limit(void)
 {
-    return 0;
+    return gpio_get_level(PIN_LIMIT_CLOSE);
 }
-
-#define EXTERNAL_LIMIT_POLL_MS          20u  /* период опроса концевика в обычном режиме */
-#define EXTERNAL_LIMIT_CONFIRM_STEP_MS  10u  /* период опроса при подтверждении          */
-#define EXTERNAL_LIMIT_CONFIRM_TOTAL_MS 40u  /* устойчивое срабатывание -> LIMIT event    */
 
 /**
  * Отправляет LIMIT event, если внешний концевик остаётся сработавшим
@@ -552,17 +530,17 @@ static void external_limit_monitor_task(void *arg)
 
         while (xEventGroupGetBits(door_monitor_events) & DOOR_MONITOR_ACTIVE_BIT) {
             if (limit == 0) {
-                vTaskDelay(pdMS_TO_TICKS(EXTERNAL_LIMIT_POLL_MS));
+                vTaskDelay(pdMS_TO_TICKS(TASK_POLL_MS));
                 limit = get_limit();
                 continue;
             }
 
-            // Концевик сработал: подтверждение в течение EXTERNAL_LIMIT_CONFIRM_TOTAL_MS
+            // Концевик сработал: подтверждение в течение TASK_CONFIRM_TOTAL_MS
             uint32_t limit_time = 0;
             bool door_stopped = false;
 
-            while (limit_time < EXTERNAL_LIMIT_CONFIRM_TOTAL_MS) {
-                vTaskDelay(pdMS_TO_TICKS(EXTERNAL_LIMIT_CONFIRM_STEP_MS));
+            while (limit_time < TASK_CONFIRM_TOTAL_MS) {
+                vTaskDelay(pdMS_TO_TICKS(TASK_CONFIRM_STEP_MS));
 
                 if (!(xEventGroupGetBits(door_monitor_events) & DOOR_MONITOR_ACTIVE_BIT)) {
                     door_stopped = true;  // выйти к блокирующему ожиданию, если дверь остановлена
@@ -574,22 +552,22 @@ static void external_limit_monitor_task(void *arg)
                     break;  // подтверждение отменено, limit уже готов для верхнего цикла
                 }
 
-                limit_time += EXTERNAL_LIMIT_CONFIRM_STEP_MS;
+                limit_time += TASK_CONFIRM_STEP_MS;
             }
 
             if (door_stopped) {
                 break;  // вернуться к блокирующему ожиданию бита
             }
 
-            if (limit_time >= EXTERNAL_LIMIT_CONFIRM_TOTAL_MS) {
+            if (limit_time >= TASK_CONFIRM_TOTAL_MS) {
                 door_event_t event = DOOR_EVENT_EXTERNAL_LIMIT;
                 xQueueSend(door_event_queue, &event, 0);
                 ESP_LOGW(TAG, "Внешний концевик: сработал %"PRIu32" мс",
-                         EXTERNAL_LIMIT_CONFIRM_TOTAL_MS);
+                         TASK_CONFIRM_TOTAL_MS);
 
                 // Событие отправлено один раз: дальше только ждём снятия бита
                 while (xEventGroupGetBits(door_monitor_events) & DOOR_MONITOR_ACTIVE_BIT) {
-                    vTaskDelay(pdMS_TO_TICKS(EXTERNAL_LIMIT_CONFIRM_STEP_MS));
+                    vTaskDelay(pdMS_TO_TICKS(TASK_CONFIRM_STEP_MS));
                 }
                 break;
             }
@@ -629,8 +607,8 @@ static void gpio_init(void)
     contact_open(PIN_START_STOP);
     contact_open(PIN_DIR);
 
-    gpio_config_t lim = {
-        .pin_bit_mask = 1ULL << PIN_LIMIT_CLOSE,
+    gpio_config_t lim = {       //включение подтягивающего резистора для концевика
+        .pin_bit_mask = 1ULL << PIN_LIMIT_CLOSE,    
         .mode         = GPIO_MODE_INPUT,
         .pull_up_en   = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
