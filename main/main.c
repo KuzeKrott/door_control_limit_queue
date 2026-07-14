@@ -7,6 +7,7 @@
 #include "freertos/task.h"
 #include "driver/i2c.h"
 #include "driver/gpio.h"
+#include "driver/ledc.h"
 #include "esp_log.h"
 #include "esp_err.h"
 #include "esp_timer.h"
@@ -18,6 +19,23 @@
 #define PIN_START_STOP      6
 #define PIN_DIR             7
 #define PIN_LIMIT_CLOSE     15  /* коллектор PC817C, pullup            */
+
+#define PIN_SERVO_1         18
+#define PIN_SERVO_2         19
+#if defined(SOC_LEDC_SUPPORT_HS_MODE) && SOC_LEDC_SUPPORT_HS_MODE
+#define SERVO_PWM_MODE      LEDC_HIGH_SPEED_MODE
+#else
+#define SERVO_PWM_MODE      LEDC_LOW_SPEED_MODE
+#endif
+#define SERVO_PWM_TIMER     LEDC_TIMER_0
+#define SERVO_PWM_CHANNEL_1 LEDC_CHANNEL_0
+#define SERVO_PWM_CHANNEL_2 LEDC_CHANNEL_1
+#define SERVO_PWM_FREQ_HZ   50
+#define SERVO_PWM_RESOLUTION LEDC_TIMER_13_BIT
+#define SERVO_MIN_PULSE_US  500u
+#define SERVO_MAX_PULSE_US  2500u
+#define SERVO_OPEN_ANGLE_DEG  0u
+#define SERVO_CLOSE_ANGLE_DEG 180u
 
 /* ── I2C / MCP4725 ────────────────────────────────────────────────── */
 #define I2C_PORT            I2C_NUM_0
@@ -151,6 +169,80 @@ static void bukd_set_direction(bool opening)
     opening ? contact_open(PIN_DIR) : contact_close(PIN_DIR);
 #endif
     ESP_LOGI(TAG, "DIR: %s", opening ? "открытие" : "закрытие");
+}
+
+static uint32_t servo_pulse_to_duty(uint32_t pulse_us)
+{
+    const uint32_t period_us = 1000000 / SERVO_PWM_FREQ_HZ;
+    const uint32_t max_duty = (1u << SERVO_PWM_RESOLUTION) - 1u;
+    return (uint32_t)(((uint64_t)pulse_us * max_duty + period_us / 2u) / period_us);
+}
+
+static void servo_set_angle(ledc_channel_t channel, uint32_t angle_deg)
+{
+    if (angle_deg > 180u) {
+        angle_deg = 180u;
+    }
+
+    const uint32_t pulse_us = SERVO_MIN_PULSE_US +
+        ((SERVO_MAX_PULSE_US - SERVO_MIN_PULSE_US) * angle_deg) / 180u;
+    const uint32_t duty = servo_pulse_to_duty(pulse_us);
+
+    ESP_ERROR_CHECK(ledc_set_duty(SERVO_PWM_MODE, channel, duty));
+    ESP_ERROR_CHECK(ledc_update_duty(SERVO_PWM_MODE, channel));
+}
+
+static void servos_set_position(bool open)
+{
+    ESP_LOGI(TAG, "Сервоприводы: %s", open ? "открытие" : "закрытие");
+    servo_set_angle(SERVO_PWM_CHANNEL_1, open ? SERVO_OPEN_ANGLE_DEG : SERVO_CLOSE_ANGLE_DEG);
+    servo_set_angle(SERVO_PWM_CHANNEL_2, open ? SERVO_OPEN_ANGLE_DEG : SERVO_CLOSE_ANGLE_DEG);
+    vTaskDelay(pdMS_TO_TICKS(500));
+}
+
+static void servos_open(void)
+{
+    servos_set_position(true);
+}
+
+static void servos_close(void)
+{
+    servos_set_position(false);
+}
+
+static void servo_init(void)
+{
+    ledc_timer_config_t timer = {
+        .speed_mode      = SERVO_PWM_MODE,
+        .timer_num       = SERVO_PWM_TIMER,
+        .duty_resolution = SERVO_PWM_RESOLUTION,
+        .freq_hz         = SERVO_PWM_FREQ_HZ,
+        .clk_cfg         = LEDC_AUTO_CLK,
+    };
+    ESP_ERROR_CHECK(ledc_timer_config(&timer));
+
+    const ledc_channel_config_t channels[] = {
+        {
+            .gpio_num   = PIN_SERVO_1,
+            .speed_mode = SERVO_PWM_MODE,
+            .channel    = SERVO_PWM_CHANNEL_1,
+            .timer_sel  = SERVO_PWM_TIMER,
+            .duty       = 0,
+            .hpoint     = 0,
+        },
+        {
+            .gpio_num   = PIN_SERVO_2,
+            .speed_mode = SERVO_PWM_MODE,
+            .channel    = SERVO_PWM_CHANNEL_2,
+            .timer_sel  = SERVO_PWM_TIMER,
+            .duty       = 0,
+            .hpoint     = 0,
+        }
+    };
+
+    for (size_t i = 0; i < sizeof(channels) / sizeof(channels[0]); ++i) {
+        ESP_ERROR_CHECK(ledc_channel_config(&channels[i]));
+    }
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -615,6 +707,8 @@ static void gpio_init(void)
         .intr_type    = GPIO_INTR_DISABLE,
     };
     ESP_ERROR_CHECK(gpio_config(&lim));
+
+    servo_init();
 }
 
 static void door_monitor_init(void)
@@ -677,6 +771,10 @@ void app_main(void)
     gpio_init();
 
     door_monitor_init();
+
+    servos_open();
+    vTaskDelay(pdMS_TO_TICKS(500));
+    servos_close();
 
     for (int i = 0; i < 3; i++){
         ESP_LOGW(TAG, "%d ...", i+1);
