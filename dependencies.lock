@@ -12,9 +12,9 @@ dependencies:
   idf:
     source:
       type: idf
-    version: 6.0.1
+    version: 6.0.2
 direct_dependencies:
 - espressif/servo
-manifest_hash: bc28c6c59aa0885e8ed569bf194d93f982dbad4b63e9c0c3ba50c6645e65be7a
+manifest_hash: f159263bd5a4ee91c0e9d93ae913ee8231bb5135011fe3df6e70d20fb06284f4
 target: esp32s3
 version: 3.0.0

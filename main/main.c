@@ -1,8 +1,3 @@
-/**
- * @file door_control.c
- * @brief Управление линейным актуатором FY017-250 через БУКД-5К и ЦАП MCP4725.
- */
-
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/i2c.h"
