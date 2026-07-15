@@ -8,7 +8,6 @@
 #include "driver/i2c.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
-#include "iot_servo.h"
 #include "esp_err.h"
 #include "esp_timer.h"
 #include "freertos/queue.h"
@@ -19,12 +18,6 @@
 #define PIN_START_STOP      6
 #define PIN_DIR             7
 #define PIN_LIMIT_CLOSE     15  /* коллектор PC817C, pullup            */
-
-#define PIN_SERVO_1             18
-#define PIN_SERVO_2             19
-#define SERVO_OPEN_ANGLE_DEG    0u
-#define SERVO_CLOSE_ANGLE_DEG   180u
-#define SERVO_MOVE_WAIT_MS      500u
 
 /* ── I2C / MCP4725 ────────────────────────────────────────────────── */
 #define I2C_PORT            I2C_NUM_0
@@ -158,37 +151,6 @@ static void bukd_set_direction(bool opening)
     opening ? contact_open(PIN_DIR) : contact_close(PIN_DIR);
 #endif
     ESP_LOGI(TAG, "DIR: %s", opening ? "открытие" : "закрытие");
-}
-
-static servo_handle_t s_servos[2];
-
-static void servos_set_position(bool open)
-{
-    const float angle = open ? (float)SERVO_OPEN_ANGLE_DEG : (float)SERVO_CLOSE_ANGLE_DEG;
-
-    ESP_LOGI(TAG, "Сервоприводы: %s", open ? "открытие" : "закрытие");
-
-    for (size_t i = 0; i < sizeof(s_servos) / sizeof(s_servos[0]); ++i) {
-        ESP_ERROR_CHECK(iot_servo_write_angle(s_servos[i], angle));
-    }
-}
-
-static void servo_init(void)
-{
-#if defined(SOC_LEDC_SUPPORT_HS_MODE) && SOC_LEDC_SUPPORT_HS_MODE
-    const ledc_mode_t speed_mode = LEDC_HIGH_SPEED_MODE;
-#else
-    const ledc_mode_t speed_mode = LEDC_LOW_SPEED_MODE;
-#endif
-    const gpio_num_t pins[] = { PIN_SERVO_1, PIN_SERVO_2 };
-    const ledc_channel_t channels[] = { LEDC_CHANNEL_0, LEDC_CHANNEL_1 };
-
-    for (size_t i = 0; i < sizeof(s_servos) / sizeof(s_servos[0]); ++i) {
-        servo_config_t cfg = SERVO_CONFIG_DEFAULT(speed_mode, LEDC_TIMER_0, channels[i], pins[i]);
-        ESP_ERROR_CHECK(iot_servo_new(&cfg, &s_servos[i]));
-    }
-
-    servos_set_position(false);
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -654,7 +616,6 @@ static void gpio_init(void)
     };
     ESP_ERROR_CHECK(gpio_config(&lim));
 
-    servo_init();
 }
 
 static void door_monitor_init(void)
@@ -717,11 +678,6 @@ void app_main(void)
     gpio_init();
 
     door_monitor_init();
-
-    servos_set_position(true);
-    vTaskDelay(pdMS_TO_TICKS(SERVO_MOVE_WAIT_MS));
-    servos_set_position(false);
-    vTaskDelay(pdMS_TO_TICKS(SERVO_MOVE_WAIT_MS));
 
     for (int i = 0; i < 3; i++){
         ESP_LOGW(TAG, "%d ...", i+1);
