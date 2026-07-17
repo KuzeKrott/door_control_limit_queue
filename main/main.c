@@ -6,13 +6,14 @@
 #include "esp_err.h"
 #include "esp_timer.h"
 #include "freertos/queue.h"
+#include "ina226.h"
 
 /* ── Пины ─────────────────────────────────────────────────────────── */
 #define PIN_SDA             4
 #define PIN_SCL             5
 #define PIN_START_STOP      6
 #define PIN_DIR             7
-#define PIN_LIMIT_CLOSE     15  /* коллектор PC817C, pullup            */
+//#define PIN_LIMIT_CLOSE     15  /* коллектор PC817C, pullup            */
 
 /* ── I2C / MCP4725 ────────────────────────────────────────────────── */
 #define I2C_PORT            I2C_NUM_0
@@ -28,6 +29,11 @@
 #define V_MAX_MM_S              10.0f   /* реальная скорость при DAC_MAX, мм/с  */
 #define CLOSE_VIRTUAL_STROKE_MM 240.0f  /* виртуальная дистанция закрытия, мм   */
 
+/* ── Датчик тока INA226 ───────────────────────────────────────────── */
+#define SHUNT_RESISTANCE_OHM  0.003f      // Параметры: шунт 0.1 Ом, ток LSB = 1 мА (измеряем до ~32 А максимум)
+#define CURRENT_LSB_A         0.001f    // ток LSB = 1 мА (измеряем до ~32 А максимум)
+
+
 #define D_ACCEL_MM  50.0f
 #define D_COAST_MM  200.0f
 #define D_DECEL_MM  50.0f
@@ -41,7 +47,7 @@
 
 #define TASK_POLL_MS          20u  
 #define TASK_CONFIRM_STEP_MS  10u  
-#define TASK_CONFIRM_TOTAL_MS 40u  
+#define TASK_CONFIRM_TOTAL_MS 500u  
 
 static const char *TAG = "door";
 static const char *TAG_OPEN = "door_open";
@@ -64,6 +70,19 @@ static EventGroupHandle_t door_monitor_events;
 
 /* ── Тип функции проверки условия досрочной остановки ────────────── */
 typedef bool (*stop_check_fn_t)(void);
+
+/* ═══════════════════════════════════════════════════════════════════
+   Датчик INA226
+   ═══════════════════════════════════════════════════════════════════ */
+static void current_sensor_init(void)
+{
+    ESP_ERROR_CHECK(ina226_init(SHUNT_RESISTANCE_OHM, CURRENT_LSB_A));
+}
+
+static float get_current(void)
+{
+    return ina226_read_current_a();
+}
 
 /* ═══════════════════════════════════════════════════════════════════
    ЦАП MCP4725
@@ -224,6 +243,8 @@ static bool dac_ramp_up(uint16_t from, uint16_t to, uint32_t total_ms)
         }
 
         dac_set((uint16_t)v);
+        float cur = get_current();
+        ESP_LOGI(TAG_OPEN, "CURRENT: %fA", cur);
         vTaskDelay(pdMS_TO_TICKS(UPDATE_MS));
     }
 
@@ -253,7 +274,7 @@ static void door_open(void)
         return;
     }
 
-    ESP_LOGI(TAG_OPEN, "Открытие: ход %"PRIu32" мс", T_COAST_MS);
+    ESP_LOGI(TAG_OPEN, "Открытие: ход %"PRIu32" мс, ток %f", T_COAST_MS, get_current());
     dac_set(DAC_MAX);
 
     BaseType_t event_received = xQueueReceive(door_event_queue, &event, pdMS_TO_TICKS(T_COAST_MS)); // Ждать первое событие не дольше T_COAST_MS
@@ -284,7 +305,6 @@ static void door_open(void)
     }
 }
 
-
 static void door_close(void)
 {
     if (CLOSE_VIRTUAL_STROKE_MM <= D_DECEL_MM) {
@@ -301,13 +321,13 @@ static void door_close(void)
     const uint32_t decel_ms = (uint32_t)(2.0f * 1000.0f * D_DECEL_MM / V_MAX_MM_S);
 
     ESP_LOGI(TAG_CLOSE,
-             "Закрытие: virtual=%.0f мм, ход=%"PRIu32" мс, торможение=%"PRIu32" мс",
-             CLOSE_VIRTUAL_STROKE_MM, coast_ms, decel_ms);
+             "Закрытие: virtual=%.0f мм, ход=%"PRIu32" мс, торможение=%"PRIu32" мс, ток = %f",
+             CLOSE_VIRTUAL_STROKE_MM, coast_ms, decel_ms, get_current());
 
     bukd_set_direction(false);
     dac_set(DAC_MAX);
     bukd_pulse_start_stop();
-    ESP_LOGI(TAG_CLOSE, "Закрытие: максимальная скорость");
+    ESP_LOGI(TAG_CLOSE, "Закрытие: максимальная скорость, ток = %f", get_current());
 
     BaseType_t event_received = xQueueReceive(door_event_queue, &event, pdMS_TO_TICKS(coast_ms)); // Ждать первое событие не дольше coast_ms
 
@@ -340,22 +360,10 @@ static void door_close(void)
     door_stop_immediately();
 }
 
-/* ═══════════════════════════════════════════════════════════════════
-   Датчик тока актуатора
-   ═══════════════════════════════════════════════════════════════════ */
-
-/* Реализация амперметра находится во внешнем модуле датчика тока. */
-static void current_sensor_init(void)
-{
-}
-static float get_current(void)
-{
-    return 0.5f;
-}
-
+// ═══════════════════════════════════════════════════════════════════
 /**
- * Отправляет FAULT event, если ток актуатора остаётся не ниже 0.7 А
- * в течение 40 мс подряд. Работает постоянно; измеряет ток только пока
+ * Отправляет FAULT event, если ток актуатора остаётся выше 0.7 А
+ * в течение 500 мс подряд. Работает постоянно; измеряет ток только пока
  * установлен DOOR_MONITOR_ACTIVE_BIT.
  */
 static void overcurrent_monitor_task(void *arg)
@@ -499,77 +507,77 @@ static void internal_limit_monitor_task(void *arg)
  * NC-датчик + PC817C: металл обнаружен → фототранзистор закрыт → GPIO HIGH.
  * Возвращает true, когда дверь находится в закрытом положении.
  */
-static int get_limit(void)
-{
-    return gpio_get_level(PIN_LIMIT_CLOSE);
-}
+// static int get_limit(void)
+// {
+//     //return gpio_get_level(PIN_LIMIT_CLOSE);
+// }
 
 /**
  * Отправляет LIMIT event, если внешний концевик остаётся сработавшим
  * не менее 40 мс подряд. Работает постоянно; проверяет концевик только
  * пока установлен DOOR_MONITOR_ACTIVE_BIT.
  */
-static void external_limit_monitor_task(void *arg)
-{
-    (void)arg;
+// static void external_limit_monitor_task(void *arg)
+// {
+//     (void)arg;
 
-    for (;;) {
-        xEventGroupWaitBits(door_monitor_events, DOOR_MONITOR_ACTIVE_BIT,
-                             pdFALSE, pdFALSE, portMAX_DELAY);
+//     for (;;) {
+//         xEventGroupWaitBits(door_monitor_events, DOOR_MONITOR_ACTIVE_BIT,
+//                              pdFALSE, pdFALSE, portMAX_DELAY);
 
-        if (!(xEventGroupGetBits(door_monitor_events) & DOOR_MONITOR_ACTIVE_BIT)) {
-            continue;  // бит сняли раньше, чем задача проснулась
-        }
+//         if (!(xEventGroupGetBits(door_monitor_events) & DOOR_MONITOR_ACTIVE_BIT)) {
+//             continue;  // бит сняли раньше, чем задача проснулась
+//         }
 
-        int limit = get_limit();
+//         int limit = get_limit();
 
-        while (xEventGroupGetBits(door_monitor_events) & DOOR_MONITOR_ACTIVE_BIT) {
-            if (limit == 0) {
-                vTaskDelay(pdMS_TO_TICKS(TASK_POLL_MS));
-                limit = get_limit();
-                continue;
-            }
+//         while (xEventGroupGetBits(door_monitor_events) & DOOR_MONITOR_ACTIVE_BIT) {
+//             if (limit == 0) {
+//                 vTaskDelay(pdMS_TO_TICKS(TASK_POLL_MS));
+//                 limit = get_limit();
+//                 continue;
+//             }
 
-            // Концевик сработал: подтверждение в течение TASK_CONFIRM_TOTAL_MS
-            uint32_t limit_time = 0;
-            bool door_stopped = false;
+//             // Концевик сработал: подтверждение в течение TASK_CONFIRM_TOTAL_MS
+//             uint32_t limit_time = 0;
+//             bool door_stopped = false;
 
-            while (limit_time < TASK_CONFIRM_TOTAL_MS) {
-                vTaskDelay(pdMS_TO_TICKS(TASK_CONFIRM_STEP_MS));
+//             while (limit_time < TASK_CONFIRM_TOTAL_MS) {
+//                 vTaskDelay(pdMS_TO_TICKS(TASK_CONFIRM_STEP_MS));
 
-                if (!(xEventGroupGetBits(door_monitor_events) & DOOR_MONITOR_ACTIVE_BIT)) {
-                    door_stopped = true;  // выйти к блокирующему ожиданию, если дверь остановлена
-                    break;
-                }
+//                 if (!(xEventGroupGetBits(door_monitor_events) & DOOR_MONITOR_ACTIVE_BIT)) {
+//                     door_stopped = true;  // выйти к блокирующему ожиданию, если дверь остановлена
+//                     break;
+//                 }
 
-                limit = get_limit();
-                if (limit == 0) {
-                    break;  // подтверждение отменено, limit уже готов для верхнего цикла
-                }
+//                 limit = get_limit();
+//                 if (limit == 0) {
+//                     break;  // подтверждение отменено, limit уже готов для верхнего цикла
+//                 }
 
-                limit_time += TASK_CONFIRM_STEP_MS;
-            }
+//                 limit_time += TASK_CONFIRM_STEP_MS;
+//             }
 
-            if (door_stopped) {
-                break;  // вернуться к блокирующему ожиданию бита
-            }
+//             if (door_stopped) {
+//                 break;  // вернуться к блокирующему ожиданию бита
+//             }
 
-            if (limit_time >= TASK_CONFIRM_TOTAL_MS) {
-                door_event_t event = DOOR_EVENT_EXTERNAL_LIMIT;
-                xQueueSend(door_event_queue, &event, 0);
-                ESP_LOGW(TAG, "Внешний концевик: сработал %"PRIu32" мс",
-                         TASK_CONFIRM_TOTAL_MS);
+//             if (limit_time >= TASK_CONFIRM_TOTAL_MS) {
+//                 door_event_t event = DOOR_EVENT_EXTERNAL_LIMIT;
+//                 xQueueSend(door_event_queue, &event, 0);
+//                 ESP_LOGW(TAG, "Внешний концевик: сработал %"PRIu32" мс",
+//                          TASK_CONFIRM_TOTAL_MS);
 
-                // Событие отправлено один раз: дальше только ждём снятия бита
-                while (xEventGroupGetBits(door_monitor_events) & DOOR_MONITOR_ACTIVE_BIT) {
-                    vTaskDelay(pdMS_TO_TICKS(TASK_CONFIRM_STEP_MS));
-                }
-                break;
-            }
-            // иначе limit уже снят — обычная проверка продолжается без повторного чтения
-        }
-    }
-}
+//                 // Событие отправлено один раз: дальше только ждём снятия бита
+//                 while (xEventGroupGetBits(door_monitor_events) & DOOR_MONITOR_ACTIVE_BIT) {
+//                     vTaskDelay(pdMS_TO_TICKS(TASK_CONFIRM_STEP_MS));
+//                 }
+//                 break;
+//             }
+//             // иначе limit уже снят — обычная проверка продолжается без повторного чтения
+//         }
+//     }
+// }
 
 /* ═══════════════════════════════════════════════════════════════════
    Инициализация
@@ -602,14 +610,14 @@ static void gpio_init(void)
     contact_open(PIN_START_STOP);
     contact_open(PIN_DIR);
 
-    gpio_config_t lim = {       //включение подтягивающего резистора для концевика
-        .pin_bit_mask = 1ULL << PIN_LIMIT_CLOSE,    
-        .mode         = GPIO_MODE_INPUT,
-        .pull_up_en   = GPIO_PULLUP_ENABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type    = GPIO_INTR_DISABLE,
-    };
-    ESP_ERROR_CHECK(gpio_config(&lim));
+    // gpio_config_t lim = {       //включение подтягивающего резистора для концевика
+    //     .pin_bit_mask = 1ULL << PIN_LIMIT_CLOSE,    
+    //     .mode         = GPIO_MODE_INPUT,
+    //     .pull_up_en   = GPIO_PULLUP_ENABLE,
+    //     .pull_down_en = GPIO_PULLDOWN_DISABLE,
+    //     .intr_type    = GPIO_INTR_DISABLE,
+    // };
+    // ESP_ERROR_CHECK(gpio_config(&lim));
 
 }
 
@@ -618,9 +626,9 @@ static void door_monitor_init(void)
     door_event_queue = xQueueCreate(10, sizeof(door_event_t));
     door_monitor_events = xEventGroupCreate();
 
-    xTaskCreate(overcurrent_monitor_task, "overcurrent_monitor", 2048, NULL, 5, NULL);
-    xTaskCreate(internal_limit_monitor_task, "internal_limit_monitor", 2048, NULL, 4, NULL);
-    xTaskCreate(external_limit_monitor_task, "external_limit_monitor", 2048, NULL, 4, NULL);
+    //xTaskCreate(overcurrent_monitor_task, "overcurrent_monitor", 2048, NULL, 5, NULL);
+    //xTaskCreate(internal_limit_monitor_task, "internal_limit_monitor", 2048, NULL, 4, NULL);
+    //xTaskCreate(external_limit_monitor_task, "external_limit_monitor", 2048, NULL, 4, NULL);
 }
 
 /*static void i2c_scan(void)
@@ -671,11 +679,13 @@ void app_main(void)
     i2c_init();
     //*i2c_scan();
     gpio_init();
-
     door_monitor_init();
+    current_sensor_init();
 
     for (int i = 0; i < 3; i++){
-        ESP_LOGW(TAG, "%d ...", i+1);
+        float cur = get_current();
+        ESP_LOGW(TAG, "%d ...   cur: %f", i+1, cur);
+        
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 
